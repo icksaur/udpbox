@@ -361,8 +361,8 @@ void serve(int port) {
             std::cout << "connect message\n";
             SecretBoxKey key;
             if (tryHandleConnect(recipient, socket, in, payload, key)) {
-                keys[senderId | ClientIdMask] = key;
-                validKeys[senderId | ClientIdMask] = true;
+                keys[senderId & ClientIdMask] = key;
+                validKeys[senderId & ClientIdMask] = true;
             }
         } else {
             std::cout << "other message\n";
@@ -409,9 +409,21 @@ void connect() {
     u_char payloadClientId;
     if (!client.tryDecrypt(payload, payloadClientId)) {
         std::cout << "failed to decrypt connect response\n";
+        return;
     }
 
     std::cout << "decrypted " << payload.size() << " byte message payload from server\n";
+
+    const char * message = "back to server";
+    payload.resize(strlen(message));
+    memcpy(payload.data(), message, strlen(message));
+    client.tryEncrypt(payload);
+    client.appendNonceAndId(payload);
+    if (!socket.trySend(payload, address)) {
+        std::cout << "failed to send " << payload.size() << " encrypted payload to server\n";
+    } else {
+        std::cout << "sent " << payload.size() << " encrypted payload to server\n";
+    }
 }
 
 void assert(bool result, const char * message) {
