@@ -21,7 +21,7 @@
             "cwd": "${workspaceFolder}",
             "program": "${workspaceFolder}/udpbox",
             "request": "launch",
-            "args": ["test"],
+            "args": ["serve", "44321"],
             "stopAtEntry": false,
             "environment": [],
             "externalConsole": false,

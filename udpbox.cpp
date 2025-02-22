@@ -12,11 +12,16 @@
 #include <exception>
 #include <vector>
 #include <string.h>
+#include <thread>
+#include <chrono>
 
 struct CryptoBoxKeypair {
     u_char publicKey[crypto_box_PUBLICKEYBYTES];
     u_char secretKey[crypto_box_SECRETKEYBYTES];
 };
+
+const u_char ConnectBit = 0x80;
+const u_char ClientIdMask = 0x0F;
 
 bool tryLoadKeys(CryptoBoxKeypair & keypair) {
     bool loaded = false;
@@ -85,7 +90,7 @@ struct CryptoBoxSender {
         size_t nonceOffset = payload.size();
         payload.resize(nonceOffset + crypto_box_NONCEBYTES + 1);
         memcpy(payload.data()+nonceOffset, nonce, crypto_box_NONCEBYTES);
-        payload.back() = clientId;
+        payload.back() = clientId | ConnectBit;
     }
 };
 
@@ -117,6 +122,10 @@ struct CryptoBoxRecipient {
             return false;
         }
         senderId = payload.back();
+        if (senderId & ConnectBit != ConnectBit) {
+            return false;
+        }
+        senderId &= ClientIdMask;
         if (senderId >= 16) {
             return false;
         }
@@ -181,6 +190,7 @@ struct CryptoSecretBox {
             std::cout << "invalid clientId found in packet: payload unmodified\n";
             return false;
         }
+        std::cout << "encrypted payload " << payloadSize << " bytes of " << payload.size() << std::endl;
         int result = crypto_secretbox_open_easy(payload.data(), payload.data(), payloadSize, nonceBytes, key);
         if (-1 == result) {
             std::cout << "failed to decrypt payload: payload unmodified\n";
@@ -219,7 +229,7 @@ struct UdpSocket {
             0,
             (sockaddr*)&in,
             &sender_len);
-
+        bytes.resize(recv_len);
         return recv_len;
     }
     size_t recv(std::vector<u_char> & bytes) {
@@ -282,8 +292,51 @@ void generateKeys() {
     std::cout << "secret.key generated: No one should ever ask for this, and you should keep it secret.\n";
 }
 
+struct SecretBoxKey {
+    u_char bytes[crypto_secretbox_KEYBYTES];
+};
+
+bool tryHandleConnect(CryptoBoxRecipient & recipient, UdpSocket & socket, sockaddr_in & in, std::vector<u_char> & payload, SecretBoxKey & key) {
+    u_char senderId;
+    if (!recipient.tryDecrypt(payload, senderId)) {
+        std::cout << "failed to decrypt payload" << std::endl;
+        return false;
+    }
+    std::cout << "decrypted " << payload.size() << " byte connect message\n";
+    if (payload.size() != sizeof(CryptoSecretBox::key)) {
+        std::cout << "payload is not size of a secret box key\n";
+        return false;
+    }
+    CryptoSecretBox client(senderId, payload.data());
+    const char * message = "connected!";
+    payload.resize(strlen(message));
+    strcpy((char*)payload.data(), message);
+    if (!client.tryEncrypt(payload)) {
+        std::cout << "failed to encrypt client connection reply\n";
+        return false;
+    }
+    client.appendNonceAndId(payload);
+    if (!socket.trySend(payload, in)) {
+        std::cout << "failed to send client connection reply\n";
+        return false;
+    }
+    std::cout << "sent " << payload.size() << " byte connection reply to client " << (int)senderId << std::endl;
+    memcpy(key.bytes, client.key, sizeof(CryptoSecretBox::key));
+    return true;
+}
+
+void handleMessage(std::vector<u_char> & payload, u_char senderId, SecretBoxKey key) {
+    CryptoSecretBox client(senderId, key.bytes);
+    if (!client.tryDecrypt(payload, senderId)) {
+        std::cout << "failed to decrypt client message\n";
+    }
+    std::cout << "received " << payload.size() << " byte message from client " << (int)(ClientIdMask & senderId) << std::endl;
+}
+
 void serve(int port) {
     CryptoBoxRecipient recipient;
+    SecretBoxKey keys[16];
+    bool validKeys[16] = {};
     if (!recipient.tryAddSender(0, "client.key")) {
         std::cout << "failed to add known sender\n";
         throw std::runtime_error("failed to add known sender");
@@ -299,32 +352,45 @@ void serve(int port) {
     while (!done) {
         sockaddr_in in;
         ssize_t length = socket.recv(payload, in);
-        if (length > 0) {
-            std::cout << "recieved " << length << " byte packet\n";
-            payload.resize(length);
-            u_char senderId;
-            if (recipient.tryDecrypt(payload, senderId)) {
-                std::cout << "decrypted " << payload.size() << " byte message from clientId " << senderId << std::endl;
+        if (length <= 0) {
+            continue;
+        }
+        std::cout << "recieved " << length << " byte packet\n";
+        u_char senderId = payload.back();
+        if ((senderId & ConnectBit) == ConnectBit) {
+            std::cout << "connect message\n";
+            SecretBoxKey key;
+            if (tryHandleConnect(recipient, socket, in, payload, key)) {
+                keys[senderId | ClientIdMask] = key;
+                validKeys[senderId | ClientIdMask] = true;
+            }
+        } else {
+            std::cout << "other message\n";
+            senderId &= ClientIdMask;
+            if (!validKeys[senderId]) {
+                std::cout << "client " << (int)senderId << " has no secret key yet\n";
             } else {
-                std::cout << "failed to decrypt payload" << std::endl;
+                handleMessage(payload, senderId, keys[senderId]);
             }
         }
     }
 }
 
 void connect() {
+    u_char clientId = 0;
+    CryptoSecretBox client(clientId);
+
     if (sodium_init() < 0) {
         throw std::runtime_error("error initializing libsodium");
     }
-    CryptoBoxSender cryptoSender("server.key", 0);
-    const char * message = "hello?";
-    std::vector<u_char> payload(strlen(message));
-    memcpy(payload.data(), message, strlen(message));
+    CryptoBoxSender cryptoSender("server.key", clientId);
+    std::vector<u_char> payload(sizeof(client.key));
+    memcpy(payload.data(), client.key, sizeof(client.key));
 
-    std::cout << "sending " << payload.size() << " byte message to server\n";
+    std::cout << "encrypting " << payload.size() << " byte connect message to server\n";
     cryptoSender.encrypt(payload);
     cryptoSender.appendNonceAndId(payload);
-    std::cout << "sending " << payload.size() << " byte encrypted payload to server\n";
+    std::cout << "sending " << payload.size() << " byte encrypted connect payload to server\n";
 
     UdpSocket socket(22412);
     sockaddr_in address = {};
@@ -334,6 +400,18 @@ void connect() {
     if (!socket.trySend(payload, address)) {
         throw std::runtime_error("failed to send on socket");
     }
+
+    using namespace std::chrono_literals;
+    std::this_thread::sleep_for(1000ms);
+
+    size_t recived = socket.recv(payload);
+    std::cout << "received " << recived << " byte message payload from server\n";
+    u_char payloadClientId;
+    if (!client.tryDecrypt(payload, payloadClientId)) {
+        std::cout << "failed to decrypt connect response\n";
+    }
+
+    std::cout << "decrypted " << payload.size() << " byte message payload from server\n";
 }
 
 void assert(bool result, const char * message) {
@@ -342,30 +420,34 @@ void assert(bool result, const char * message) {
     }
 }
 
+void testCryptoSecretBox() {
+    CryptoSecretBox sender(4);
+    CryptoSecretBox recipient(4, sender.key);
+
+    const char * message = "test!";
+    std::vector<u_char> payload(strlen(message));
+    strcpy((char*)payload.data(), message);
+    std::vector<u_char> originalPayload(payload);
+
+    u_char clientId = 255;
+
+    assert(sender.tryEncrypt(payload), "encrypt");
+    sender.appendNonceAndId(payload);
+    assert(recipient.tryDecrypt(payload, clientId), "decrypt");
+    assert(clientId == 4, "clientId retrieved");
+    assert(originalPayload.size() == payload.size(), "payload size match");
+    assert(0 == memcmp(originalPayload.data(), payload.data(), originalPayload.size()), "payload match");
+    assert(sender.nonce == 1, "nonce increment");
+}
+
 void test() {
     try {
-        CryptoSecretBox sender(4);
-        CryptoSecretBox recipient(4, sender.key);
-
-        const char * message = "test!";
-        std::vector<u_char> payload(strlen(message));
-        strcpy((char*)payload.data(), message);
-        std::vector<u_char> originalPayload(payload);
-
-        u_char clientId = 255;
-
-        assert(sender.tryEncrypt(payload), "encrypt");
-        sender.appendNonceAndId(payload);
-        assert(recipient.tryDecrypt(payload, clientId), "decrypt");
-        assert(clientId == 4, "clientId retrieved");
-        assert(originalPayload.size() == payload.size(), "payload size match");
-        assert(0 == memcmp(originalPayload.data(), payload.data(), originalPayload.size()), "payload match");
-        assert(sender.nonce == 1, "nonce increment");
+        testCryptoSecretBox();
     } catch (std::runtime_error & e) {
         std::cout << "assertion failed: " << e.what() << std::endl;
         return;
     }
-    std::cout << "no tests failed" << std::endl;
+    std::cout << "tests passed" << std::endl;
 }
 
 int main(int argc, char ** argv) {
@@ -376,26 +458,19 @@ int main(int argc, char ** argv) {
     std::string verb(argv[1]);
     if (verb == "help") {
         printHelp();
-        return 0;
     } else if (verb == "generate") {
         generateKeys();
-        return 0;
     } else if (verb == "connect") {
         connect();
     } else if (verb == "test") {
         test();
     } else if (verb == "serve") {
-        if (argc < 3) {
+        int port;
+        if (argc < 3 || -1 == (port = atoi(argv[2]))) {
             printHelp();
             return 0;
-        } else {
-            int port = atoi(argv[2]);
-            if (port == -1) {
-                printHelp();
-                return 0;
-            }
-            serve(port);
         }
+        serve(port);
     }
 
     return 0;
