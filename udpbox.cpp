@@ -255,8 +255,8 @@ R"(udpbox: <command>
 available commands:
 help: show this text
 generate: generate a new public and private key
-serve <port>: listen for clients on given port
-connect: connect to server
+serve <port>: listen for clients
+connect <address> <port>: connect to server
 )";
 }
 
@@ -359,7 +359,7 @@ void serve(int port) {
     }
 }
 
-void connect() {
+void connect(const char * addressString, int port) {
     u_char clientId = 0;
     CryptoSecretBox client(clientId);
     CryptoBoxSender cryptoSender("server.key", clientId);
@@ -371,8 +371,8 @@ void connect() {
     UdpSocket socket(22412);
     sockaddr_in address = {};
     address.sin_family = AF_INET;
-    address.sin_port = htons(44321);
-    address.sin_addr.s_addr = inet_addr("127.0.0.1");
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = inet_addr(addressString);
     if (!socket.trySend(payload, address)) {
         throw std::runtime_error("failed to send on socket");
     }
@@ -445,7 +445,17 @@ int main(int argc, char ** argv) {
     } else if (verb == "generate") {
         generateKeys();
     } else if (verb == "connect") {
-        connect();
+        if (argc < 4) {
+            printHelp();
+            return 0;
+        }
+        const char * address;
+        int port;
+        if (-1 == (port = atoi(argv[3]))) {
+            printHelp();
+            return 0;
+        }
+        connect(argv[2], port);
     } else if (verb == "serve") {
         int port;
         if (argc < 3 || -1 == (port = atoi(argv[2]))) {
