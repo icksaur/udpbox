@@ -116,24 +116,24 @@ struct CryptoBoxRecipient {
         senders[id].loaded = loaded;
         return loaded;
     }
-    bool tryDecrypt(std::vector<u_char> & payload, u_char & senderId) {
+    bool tryDecrypt(std::vector<u_char> & payload, u_char & clientId) {
         int ciphertextSize = payload.size() - crypto_box_NONCEBYTES - 1;
         if (ciphertextSize <= 0) {
             return false;
         }
-        senderId = payload.back();
-        if (senderId & ConnectBit != ConnectBit) {
+        clientId = payload.back();
+        if (clientId & ConnectBit != ConnectBit) {
             return false;
         }
-        senderId &= ClientIdMask;
-        if (senderId >= 16) {
+        clientId &= ClientIdMask;
+        if (clientId >= 16) {
             return false;
         }
         int result =
             crypto_box_open_easy(
                 payload.data(), payload.data(),
                 ciphertextSize, payload.data() + ciphertextSize,
-                senders[senderId].publicKey.publicKey, recipientKeypair.secretKey);
+                senders[clientId].publicKey.publicKey, recipientKeypair.secretKey);
         if (result == -1) {
             return false;
         }
@@ -190,7 +190,6 @@ struct CryptoSecretBox {
             std::cout << "invalid clientId found in packet: payload unmodified\n";
             return false;
         }
-        std::cout << "encrypted payload " << payloadSize << " bytes of " << payload.size() << std::endl;
         int result = crypto_secretbox_open_easy(payload.data(), payload.data(), payloadSize, nonceBytes, key);
         if (-1 == result) {
             std::cout << "failed to decrypt payload: payload unmodified\n";
@@ -257,9 +256,9 @@ available commands:
 help: show this text
 generate: generate a new public and private key
 serve <port>: listen for clients on given port
-connect: connect to a server
-test: run tests and exit
-)";}
+connect: connect to server
+)";
+}
 
 FILE * openNewFile(const char * filename) {
     FILE * newfile = fopen(filename, "wx");
@@ -270,10 +269,6 @@ FILE * openNewFile(const char * filename) {
 }
 
 void generateKeys() {
-    if (sodium_init() < 0) {
-        std::cout << "error initializing libsodium\n";
-        return;
-    }
     FILE * publicfile = openNewFile("public.key");
     FILE * secretfile = openNewFile("secret.key");
     if (!publicfile || !secretfile) {
@@ -297,17 +292,16 @@ struct SecretBoxKey {
 };
 
 bool tryHandleConnect(CryptoBoxRecipient & recipient, UdpSocket & socket, sockaddr_in & in, std::vector<u_char> & payload, SecretBoxKey & key) {
-    u_char senderId;
-    if (!recipient.tryDecrypt(payload, senderId)) {
+    u_char clientId;
+    if (!recipient.tryDecrypt(payload, clientId)) {
         std::cout << "failed to decrypt payload" << std::endl;
         return false;
     }
-    std::cout << "decrypted " << payload.size() << " byte connect message\n";
     if (payload.size() != sizeof(CryptoSecretBox::key)) {
         std::cout << "payload is not size of a secret box key\n";
         return false;
     }
-    CryptoSecretBox client(senderId, payload.data());
+    CryptoSecretBox client(clientId, payload.data());
     const char * message = "connected!";
     payload.resize(strlen(message));
     strcpy((char*)payload.data(), message);
@@ -320,17 +314,16 @@ bool tryHandleConnect(CryptoBoxRecipient & recipient, UdpSocket & socket, sockad
         std::cout << "failed to send client connection reply\n";
         return false;
     }
-    std::cout << "sent " << payload.size() << " byte connection reply to client " << (int)senderId << std::endl;
     memcpy(key.bytes, client.key, sizeof(CryptoSecretBox::key));
     return true;
 }
 
-void handleMessage(std::vector<u_char> & payload, u_char senderId, SecretBoxKey key) {
-    CryptoSecretBox client(senderId, key.bytes);
-    if (!client.tryDecrypt(payload, senderId)) {
+void handleMessage(std::vector<u_char> & payload, u_char clientId, SecretBoxKey key) {
+    CryptoSecretBox client(clientId, key.bytes);
+    if (!client.tryDecrypt(payload, clientId)) {
         std::cout << "failed to decrypt client message\n";
     }
-    std::cout << "received " << payload.size() << " byte message from client " << (int)(ClientIdMask & senderId) << std::endl;
+    std::cout << "received " << payload.size() << " byte message from client " << (int)(ClientIdMask & clientId) << std::endl;
 }
 
 void serve(int port) {
@@ -338,39 +331,29 @@ void serve(int port) {
     SecretBoxKey keys[16];
     bool validKeys[16] = {};
     if (!recipient.tryAddSender(0, "client.key")) {
-        std::cout << "failed to add known sender\n";
         throw std::runtime_error("failed to add known sender");
     }
 
-    if (sodium_init() < 0) {
-        throw std::runtime_error("error initializing libsodium");
-    }
     UdpSocket socket(port);
     std::vector<u_char> payload(5000);
-    std::cout << "echoing udp on port " << port << '\n';
-    bool done = false;
-    while (!done) {
+    std::cout << "serving on port " << port << '\n';
+    while (true) {
         sockaddr_in in;
         ssize_t length = socket.recv(payload, in);
-        if (length <= 0) {
+        if (length == 0) {
             continue;
         }
-        std::cout << "recieved " << length << " byte packet\n";
-        u_char senderId = payload.back();
-        if ((senderId & ConnectBit) == ConnectBit) {
-            std::cout << "connect message\n";
+        u_char clientId = (payload.back() & ClientIdMask);
+        bool connectBit = ((payload.back() & ConnectBit) == ConnectBit);
+        if (connectBit) {
             SecretBoxKey key;
             if (tryHandleConnect(recipient, socket, in, payload, key)) {
-                keys[senderId & ClientIdMask] = key;
-                validKeys[senderId & ClientIdMask] = true;
+                keys[clientId] = key;
+                validKeys[clientId] = true;
             }
         } else {
-            std::cout << "other message\n";
-            senderId &= ClientIdMask;
-            if (!validKeys[senderId]) {
-                std::cout << "client " << (int)senderId << " has no secret key yet\n";
-            } else {
-                handleMessage(payload, senderId, keys[senderId]);
+            if (validKeys[clientId]) {
+                handleMessage(payload, clientId, keys[clientId]);
             }
         }
     }
@@ -379,18 +362,11 @@ void serve(int port) {
 void connect() {
     u_char clientId = 0;
     CryptoSecretBox client(clientId);
-
-    if (sodium_init() < 0) {
-        throw std::runtime_error("error initializing libsodium");
-    }
     CryptoBoxSender cryptoSender("server.key", clientId);
     std::vector<u_char> payload(sizeof(client.key));
     memcpy(payload.data(), client.key, sizeof(client.key));
-
-    std::cout << "encrypting " << payload.size() << " byte connect message to server\n";
     cryptoSender.encrypt(payload);
     cryptoSender.appendNonceAndId(payload);
-    std::cout << "sending " << payload.size() << " byte encrypted connect payload to server\n";
 
     UdpSocket socket(22412);
     sockaddr_in address = {};
@@ -405,14 +381,17 @@ void connect() {
     std::this_thread::sleep_for(1000ms);
 
     size_t recived = socket.recv(payload);
-    std::cout << "received " << recived << " byte message payload from server\n";
     u_char payloadClientId;
     if (!client.tryDecrypt(payload, payloadClientId)) {
         std::cout << "failed to decrypt connect response\n";
         return;
     }
 
-    std::cout << "decrypted " << payload.size() << " byte message payload from server\n";
+    if (0 == strcmp((char*)payload.data(), "connected!")) {
+        std::cout << "received unexpected response from server\n";
+    }
+
+    std::cout << "received connection ack from server\n";
 
     const char * message = "back to server";
     payload.resize(strlen(message));
@@ -422,7 +401,7 @@ void connect() {
     if (!socket.trySend(payload, address)) {
         std::cout << "failed to send " << payload.size() << " encrypted payload to server\n";
     } else {
-        std::cout << "sent " << payload.size() << " encrypted payload to server\n";
+        std::cout << "sent test message back to server\n";
     }
 }
 
@@ -452,20 +431,13 @@ void testCryptoSecretBox() {
     assert(sender.nonce == 1, "nonce increment");
 }
 
-void test() {
-    try {
-        testCryptoSecretBox();
-    } catch (std::runtime_error & e) {
-        std::cout << "assertion failed: " << e.what() << std::endl;
-        return;
-    }
-    std::cout << "tests passed" << std::endl;
-}
-
 int main(int argc, char ** argv) {
     if (argc < 2) {
         printHelp();
         return 0;
+    }
+    if (sodium_init() < 0) {
+        throw std::runtime_error("error initializing libsodium");
     }
     std::string verb(argv[1]);
     if (verb == "help") {
@@ -474,8 +446,6 @@ int main(int argc, char ** argv) {
         generateKeys();
     } else if (verb == "connect") {
         connect();
-    } else if (verb == "test") {
-        test();
     } else if (verb == "serve") {
         int port;
         if (argc < 3 || -1 == (port = atoi(argv[2]))) {
